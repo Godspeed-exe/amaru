@@ -18,6 +18,7 @@ use std::{
 };
 
 use amaru_kernel::{BlockBodyParts, Epoch, EraHistory, Header, HeaderHash, IsHeader, Nonce, ORIGIN_HASH, Point, Slot};
+use amaru_metrics::ForgeMetrics;
 use amaru_observability::{debug, error, info, warn};
 use amaru_ouroboros::praos::nonce as praos_nonce;
 use amaru_ouroboros_traits::{FindCommonAncestorResult, ForgingCredentialsError, HeaderDraft, Nonces, kes_message};
@@ -141,12 +142,13 @@ on_receive!(Signing, Publish =>
 );
 
 macro_rules! arm_next_lead {
-    ($session:expr, $state:ident, $now:expr, $mode:expr) => {{
+    ($session:expr, $state:ident, $now:expr, $mode:expr, $eff:expr) => {{
         // Every scheduling decision, including "nothing to arm", invalidates a DueLead
         // that was already queued when its timer was cancelled.
         $state.schedule_generation = $state.schedule_generation.wrapping_add(1);
         drop_elapsed($state, $now);
         log_schedule($state, $now, $mode);
+        record_schedule($state, $eff).await;
         if let Some((slot, when)) =
             next_lead_deadline(&$state.schedule, $state.consensus_parameters.era_history(), $now)
         {
@@ -161,12 +163,12 @@ macro_rules! arm_next_lead {
 }
 
 macro_rules! finish_with_next_lead {
-    ($session:expr, $state:ident, $now:expr, $mode:expr) => {{
+    ($session:expr, $state:ident, $now:expr, $mode:expr, $eff:expr) => {{
         if let Some(id) = $state.next_lead.take() {
             let (_cancelled, session) = $session.cancel_schedule(id).await;
-            arm_next_lead!(session, $state, $now, $mode)
+            arm_next_lead!(session, $state, $now, $mode, $eff)
         } else {
-            arm_next_lead!($session, $state, $now, $mode)
+            arm_next_lead!($session, $state, $now, $mode, $eff)
         }
     }};
 }
@@ -275,7 +277,7 @@ async fn handle_adopted_tip(
         session = session.detach(effect, |schedule| LeaderSchedule { schedule }.into()).await;
     }
     let mode = eff.external(QueryConsensusModeEffect).await;
-    finish_with_next_lead!(session, state, now, mode)
+    finish_with_next_lead!(session, state, now, mode, &eff)
 }
 
 async fn handle_leader_schedule(
@@ -285,13 +287,13 @@ async fn handle_leader_schedule(
     eff: Effects<ForgeBlockMsg>,
 ) -> Idle {
     let mode = eff.external(QueryConsensusModeEffect).await;
-    let (now, session) = idle.receive(&msg, eff).clock().await;
+    let (now, session) = idle.receive(&msg, eff.clone()).clock().await;
 
     // A result whose nonce no longer matches the outstanding request was computed
     // from a candidate nonce a rollback has since replaced; it is dropped.
     state.schedule.install(msg.schedule);
 
-    finish_with_next_lead!(session, state, now, mode)
+    finish_with_next_lead!(session, state, now, mode, &eff)
 }
 
 async fn handle_due_lead(state: &mut ForgeData, idle: Idle, lead: DueLead, eff: Effects<ForgeBlockMsg>) -> Idle {
@@ -321,10 +323,10 @@ async fn handle_due_lead(state: &mut ForgeData, idle: Idle, lead: DueLead, eff: 
         }
     };
     if woke_late {
-        warn!(consensus::forge::MISSED_SLOT, slot, reason = MissedSlotReason::WokeLate.as_str());
+        missed_slot(&eff, slot, MissedSlotReason::WokeLate).await;
         let session = session.finish().receive(&Proceed, eff.clone());
         let mode = eff.external(QueryConsensusModeEffect).await;
-        return finish_with_next_lead!(session, state, now, mode);
+        return finish_with_next_lead!(session, state, now, mode, &eff);
     }
 
     let parent_point = match parent_to_extend(
@@ -334,18 +336,18 @@ async fn handle_due_lead(state: &mut ForgeData, idle: Idle, lead: DueLead, eff: 
     ) {
         Ok(point) => point,
         Err(reason) => {
-            warn!(consensus::forge::MISSED_SLOT, slot, reason = reason.as_str());
+            missed_slot(&eff, slot, reason).await;
             let session = session.finish().receive(&Proceed, eff.clone());
             let mode = eff.external(QueryConsensusModeEffect).await;
-            return finish_with_next_lead!(session, state, now, mode);
+            return finish_with_next_lead!(session, state, now, mode, &eff);
         }
     };
 
     let Some(cert) = cert else {
-        warn!(consensus::forge::MISSED_SLOT, slot, reason = MissedSlotReason::NotLed.as_str());
+        missed_slot(&eff, slot, MissedSlotReason::NotLed).await;
         let session = session.finish().receive(&Proceed, eff.clone());
         let mode = eff.external(QueryConsensusModeEffect).await;
-        return finish_with_next_lead!(session, state, now, mode);
+        return finish_with_next_lead!(session, state, now, mode, &eff);
     };
 
     // A replacement schedule can arm a slot this stage already published. The parent
@@ -353,7 +355,7 @@ async fn handle_due_lead(state: &mut ForgeData, idle: Idle, lead: DueLead, eff: 
     if state.published.is_some_and(|(forged_slot, parent)| forged_slot == slot && parent == parent_point.hash()) {
         let session = session.finish().receive(&Proceed, eff.clone());
         let mode = eff.external(QueryConsensusModeEffect).await;
-        return finish_with_next_lead!(session, state, now, mode);
+        return finish_with_next_lead!(session, state, now, mode, &eff);
     }
 
     let session = session.finish().receive(&Proceed, eff.clone());
@@ -366,10 +368,10 @@ async fn handle_due_lead(state: &mut ForgeData, idle: Idle, lead: DueLead, eff: 
     let block_body_parts = match block_body_parts {
         Ok(block_body_parts) => block_body_parts,
         Err(TakeForForgeError::TipsChanged { .. }) => {
-            warn!(consensus::forge::MISSED_SLOT, slot, reason = MissedSlotReason::LedgerTipChanged.as_str());
+            missed_slot(&eff, slot, MissedSlotReason::LedgerTipChanged).await;
             let session = session.finish().receive(&Skip, eff.clone());
             let mode = eff.external(QueryConsensusModeEffect).await;
-            return finish_with_next_lead!(session, state, now, mode);
+            return finish_with_next_lead!(session, state, now, mode, &eff);
         }
         Err(error) => {
             error!(
@@ -397,10 +399,10 @@ async fn handle_due_lead(state: &mut ForgeData, idle: Idle, lead: DueLead, eff: 
     let header = match signed {
         Ok(signature) => Header::new(header_body, signature),
         Err(SignHeaderError::Credentials(ForgingCredentialsError::Period(error))) => {
-            warn!(consensus::forge::MISSED_SLOT, slot, reason = ocert_miss(&error).as_str());
+            missed_slot(&eff, slot, ocert_miss(&error)).await;
             let session = session.finish().receive(&Missed, eff.clone());
             let mode = eff.external(QueryConsensusModeEffect).await;
-            return finish_with_next_lead!(session, state, now, mode);
+            return finish_with_next_lead!(session, state, now, mode, &eff);
         }
         Err(error) => {
             error!(consensus::forge::FORGE_FAILED, slot, step = "sign_header", error = error.to_string());
@@ -453,8 +455,28 @@ async fn handle_due_lead(state: &mut ForgeData, idle: Idle, lead: DueLead, eff: 
     state.published = Some((slot, parent_hash));
     info!(consensus::forge::FORGED, slot, header_hash, parent = parent_hash);
     let session = session.send(&state.select_chain, forged).await;
+    Metrics::new(&eff).record(ForgeMetrics::Forged.into()).await;
     let mode = eff.external(QueryConsensusModeEffect).await;
-    finish_with_next_lead!(session, state, now, mode)
+    finish_with_next_lead!(session, state, now, mode, &eff)
+}
+
+/// Trace a slot that is not forged, and count it as missed. A slot the schedule does not lead
+/// owed no block, so it is traced only.
+async fn missed_slot(eff: &Effects<ForgeBlockMsg>, slot: Slot, reason: MissedSlotReason) {
+    warn!(consensus::forge::MISSED_SLOT, slot, reason = reason.as_str());
+    if reason != MissedSlotReason::NotLed {
+        Metrics::new(eff).record(ForgeMetrics::MissedSlot { reason: reason.as_str().to_string() }.into()).await;
+    }
+}
+
+/// Report the led slots still ahead, once a leader schedule has been computed.
+async fn record_schedule(state: &ForgeData, eff: &Effects<ForgeBlockMsg>) {
+    let slots = state.schedule.led_counts();
+    if slots.is_empty() {
+        return;
+    }
+    let ahead = u64::try_from(slots.values().sum::<usize>()).unwrap_or(u64::MAX);
+    Metrics::new(eff).record(ForgeMetrics::ScheduledSlots(ahead).into()).await;
 }
 
 fn log_schedule(state: &ForgeData, now: Instant, mode: ConsensusMode) {

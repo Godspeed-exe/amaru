@@ -37,6 +37,10 @@ Other guiding principles:
 
 ## Unreleased
 
+### Added
+
+- **amaru-consensus**: every node reports `cardano_node_metrics_forging_enabled_int`, 1 when it holds forging credentials and 0 otherwise. Block producers also count the blocks they forge as `cardano_node_metrics_Forge_forged_counter` and the led slots they do not forge as `cardano_node_metrics_slotsMissed_int`, with the reason of each miss as a label of `amaru_consensus_forge_missed_slot_total`, and report the led slots still ahead as `amaru_consensus_forge_scheduled_slots`. ([#1584](https://github.com/pragma-org/amaru/discussions/1584))
+
 ## [v10.11.20261112](https://github.com/pragma-org/amaru/releases/tag/v10.11.20261112)
 
 ### Added

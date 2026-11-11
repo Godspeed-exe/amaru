@@ -22,6 +22,7 @@ use amaru_kernel::{
     Epoch, Header, IsHeader, KesPeriod, Nonce, ORIGIN_HASH, PREPROD_ERA_HISTORY, PREPROD_GLOBAL_PARAMETERS, Point,
     Slot, make_header, maths::FixedDecimal,
 };
+use amaru_metrics::{ForgeMetrics, MetricsEvent};
 use amaru_observability::tracing::Level;
 use amaru_ouroboros::{kes, praos::header::AssertKesSignatureError};
 use amaru_ouroboros_traits::{
@@ -56,7 +57,7 @@ fn adopted_tip_reports_the_kes_state_of_the_forging_key() {
     let recorded = prep.metrics.lock().unwrap();
     let kes = recorded
         .iter()
-        .find_map(|event| if let amaru_metrics::MetricsEvent::KesMetrics(kes) = event { Some(*kes) } else { None })
+        .find_map(|event| if let MetricsEvent::KesMetrics(kes) = event { Some(*kes) } else { None })
         .expect("the forge stage records the KES state on an adopted tip");
     // test_prep's certificate starts at KES period 0 and preprod allows 62 evolutions.
     assert_eq!(kes.operational_certificate_start_kes_period, 0);
@@ -235,6 +236,93 @@ fn lead_slot_without_credentials_terminates() {
         .assert_and_remove(Level::INFO, &["forge.block_body"])
         .assert_no_remaining_at([Level::INFO, Level::WARN, Level::ERROR]);
     assert!(prep.store.load_headers().next().is_none());
+}
+
+/// Forge metrics the stage recorded, in order.
+fn forge_metrics(prep: &TestPrep) -> Vec<ForgeMetrics> {
+    let recorded = prep.metrics.lock().unwrap();
+    recorded
+        .iter()
+        .filter_map(|event| if let MetricsEvent::ForgeMetrics(forge) = event { Some(forge.clone()) } else { None })
+        .collect()
+}
+
+fn missed(reason: &str) -> ForgeMetrics {
+    ForgeMetrics::MissedSlot { reason: reason.to_string() }
+}
+
+#[test]
+fn a_forged_block_is_counted() {
+    let mut prep = test_prep();
+    let slot = simulation_slot();
+    let period = prep.state.data.consensus_parameters.slot_to_kes_period(slot);
+    use_certificate_starting(&mut prep, period);
+    prep.state.data.schedule = ready_schedule(start_in_era().epoch, slot..slot + 1);
+    prep.state.data.adopted_tip = Point::Specific(Slot::from(u64::from(slot).saturating_sub(1)), ORIGIN_HASH, 1.into());
+    let msg = ForgeBlockMsg::from(DueLead { slot, generation: 0 });
+    let (_running, _guards, _logs, _stage) = setup(&prep, msg);
+
+    assert_eq!(forge_metrics(&prep), [ForgeMetrics::Forged, ForgeMetrics::ScheduledSlots(0)]);
+}
+
+#[test]
+fn a_missed_slot_is_counted_with_its_reason() {
+    let mut prep = test_prep();
+    use_certificate_starting(&mut prep, KesPeriod::from(1_000_000));
+    let slot = simulation_slot();
+    prep.state.data.schedule = ready_schedule(start_in_era().epoch, slot..slot + 2);
+    prep.state.data.adopted_tip = Point::Specific(slot, ORIGIN_HASH, 1.into());
+    let msg = ForgeBlockMsg::from(DueLead { slot, generation: 0 });
+    let (_running, _guards, _logs, _stage) = setup_until_sleeping(&prep, msg);
+
+    // The following led slot is still ahead.
+    assert_eq!(forge_metrics(&prep), [missed("ocert_not_yet_valid"), ForgeMetrics::ScheduledSlots(1)]);
+}
+
+#[test]
+fn a_late_due_lead_is_counted_as_missed() {
+    let mut prep = test_prep();
+    let slot = Slot::from(u64::from(simulation_slot()).saturating_sub(5));
+    prep.state.data.schedule = ready_schedule(Epoch::from(0), slot..slot + 1);
+    prep.state.data.adopted_tip = Point::Specific(slot, ORIGIN_HASH, 1.into());
+    let msg = ForgeBlockMsg::from(DueLead { slot, generation: 0 });
+    let (_running, _guards, _logs, _stage) = setup(&prep, msg);
+
+    assert_eq!(forge_metrics(&prep), [missed("woke_late"), ForgeMetrics::ScheduledSlots(0)]);
+}
+
+#[test]
+fn a_slot_the_schedule_does_not_lead_is_not_counted_as_missed() {
+    let mut prep = test_prep();
+    let slot = simulation_slot();
+    prep.state.data.schedule = ready_schedule(start_in_era().epoch, slot + 1..slot + 2);
+    prep.state.data.adopted_tip = Point::Specific(Slot::from(u64::from(slot).saturating_sub(1)), ORIGIN_HASH, 1.into());
+    let msg = ForgeBlockMsg::from(DueLead { slot, generation: 0 });
+    let (_running, _guards, mut logs, _stage) = setup_until_sleeping(&prep, msg);
+
+    logs.assert_and_remove(Level::WARN, &["not_led"]).assert_no_remaining_at([Level::INFO, Level::WARN, Level::ERROR]);
+    assert_eq!(forge_metrics(&prep), [ForgeMetrics::ScheduledSlots(1)]);
+}
+
+#[test]
+fn a_stale_lead_slot_records_no_outcome() {
+    let mut prep = test_prep();
+    let slot = Slot::from(11);
+    prep.state.data.schedule_generation = 2;
+    prep.state.data.schedule = ready_schedule(Epoch::from(0), slot..slot + 1);
+    let msg = ForgeBlockMsg::from(DueLead { slot, generation: 1 });
+    let (_running, _guards, _logs, _stage) = setup(&prep, msg);
+
+    assert_eq!(forge_metrics(&prep), []);
+}
+
+#[test]
+fn scheduled_slots_are_not_reported_before_a_schedule_is_computed() {
+    let prep = test_prep();
+    let msg = ForgeBlockMsg::from(AdoptedTip { tip: Point::Origin, parent: Point::Origin });
+    let (_running, _guards, _logs, _stage) = setup(&prep, msg);
+
+    assert_eq!(forge_metrics(&prep), []);
 }
 
 fn current_era_epochs() -> (Epoch, Slot, Slot) {

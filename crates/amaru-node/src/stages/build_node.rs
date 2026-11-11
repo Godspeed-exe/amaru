@@ -33,7 +33,7 @@ use amaru_ledger::{
     store::{OpenErrorKind, StoreError as LedgerStoreError},
 };
 use amaru_mempool::{InMemoryMempool, MempoolConfig};
-use amaru_metrics::Meter;
+use amaru_metrics::{ForgeMetrics, Meter, MetricRecorder, MetricsEvent};
 use amaru_network::{connection::TokioConnections, resolve::init_resolver};
 use amaru_observability::warn;
 use amaru_ouroboros::{
@@ -460,6 +460,8 @@ pub fn build_node(
             kes_period = issuer.operational_cert.operational_cert_kes_period,
         );
     }
+    // Every node reports whether it forges, not only block producers.
+    MetricsEvent::from(ForgeMetrics::Enabled(config.forging_credentials.is_some())).record_to_meter(&meter);
     let block_validator = Arc::new(make_block_validator(&config.ledger_config, state, chain_store.clone())?);
 
     // Make resources

@@ -17,6 +17,7 @@ const _: () = amaru_deps::AMARU_DEPS_USED;
 
 pub use crate::{
     consensus::ConsensusMetrics,
+    forge::ForgeMetrics,
     kes::KesMetrics,
     ledger::LedgerMetrics,
     mempool::MempoolMetrics,
@@ -26,6 +27,7 @@ pub use crate::{
 };
 
 pub mod consensus;
+pub mod forge;
 pub mod kes;
 pub mod ledger;
 pub mod mempool;
@@ -41,6 +43,7 @@ pub enum MetricsEvent {
     MempoolMetrics(MempoolMetrics),
     ProtocolMetrics(ProtocolMetrics),
     ConsensusMetrics(ConsensusMetrics),
+    ForgeMetrics(ForgeMetrics),
     KesMetrics(KesMetrics),
     SystemMetrics(SystemMetrics),
 }
@@ -57,6 +60,7 @@ impl MetricRecorder for MetricsEvent {
             MetricsEvent::MempoolMetrics(mempool_metrics) => mempool_metrics.record_to_meter(meter),
             MetricsEvent::ProtocolMetrics(protocol_metrics) => protocol_metrics.record_to_meter(meter),
             MetricsEvent::ConsensusMetrics(consensus_metrics) => consensus_metrics.record_to_meter(meter),
+            MetricsEvent::ForgeMetrics(forge_metrics) => forge_metrics.record_to_meter(meter),
             MetricsEvent::KesMetrics(kes_metrics) => kes_metrics.record_to_meter(meter),
             MetricsEvent::SystemMetrics(system_metrics) => system_metrics.record_to_meter(meter),
         }
